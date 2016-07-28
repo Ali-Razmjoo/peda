@@ -1,4 +1,3 @@
-#
 #       PEDA - Python Exploit Development Assistance for GDB
 #
 #       Copyright (C) 2012 Long Le Dinh <longld at vnsecurity.net>
@@ -51,7 +50,7 @@ else:
     from urllib import urlopen
     from urllib import urlencode
     pyversion = 2
-	
+
 REGISTERS = {
     8 : ["al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"],
     16: ["ax", "bx", "cx", "dx"],
@@ -443,17 +442,8 @@ class PEDA(object):
                 else:
                     return None
 
-        if self.getos() == "Linux":
-            out = self.execute_redirect('info proc')
-
-        if out is None: # non-Linux or cannot access /proc, fallback
-            out = self.execute_redirect('info program')
-        out = out.splitlines()[0]
-        if "process" in out or "Thread" in out:
-            pid = out.split()[-1].strip(".)")
-            return int(pid)
-        else:
-            return None
+        pid = gdb.selected_inferior().pid
+        return int(pid) if pid else None
 
     def getos(self):
         """
@@ -1451,6 +1441,30 @@ class PEDA(object):
 
             return binmap
 
+        def _get_allmaps_osx(pid, remote=False):
+            maps = []
+            #_DATA                 00007fff77975000-00007fff77976000 [    4K] rw-/rw- SM=COW  /usr/lib/system/libremovefile.dylib
+            pattern = re.compile("([^\n]*)\s*  ([0-9a-f][^-\s]*)-([^\s]*) \[.*\]\s([^/]*).*  (.*)")
+
+            if remote: # remote target, not yet supported
+                return maps
+            else: # local target
+                try:  out = execute_external_command("/usr/bin/vmmap -w %s" % self.getpid())
+                except: error_msg("could not read vmmap of process")
+
+            matches = pattern.findall(out)
+            if matches:
+                for (name, start, end, perm, mapname) in matches:
+                    if name.startswith("Stack"):
+                        mapname = "[stack]"
+                    start = to_int("0x%s" % start)
+                    end = to_int("0x%s" % end)
+                    if mapname == "":
+                        mapname = name.strip()
+                    maps += [(start, end, perm, mapname)]
+            return maps
+
+
         def _get_allmaps_freebsd(pid, remote=False):
             maps = []
             mpath = "/proc/%s/map" % pid
@@ -1506,7 +1520,10 @@ class PEDA(object):
         result = []
         pid = self.getpid()
         if not pid: # not running, try to use elfheader()
-            return _get_offline_maps()
+            try:
+                return _get_offline_maps()
+            except:
+                return []
 
         # retrieve all maps
         os   = self.getos()
@@ -1514,7 +1531,8 @@ class PEDA(object):
         maps = []
         try:
             if   os == "FreeBSD": maps = _get_allmaps_freebsd(pid, rmt)
-            elif os == "Linux" :   maps = _get_allmaps_linux(pid, rmt)
+            elif os == "Linux"  : maps = _get_allmaps_linux(pid, rmt)
+            elif os == "Darwin" : maps = _get_allmaps_osx(pid, rmt)
         except Exception as e:
             if config.Option.get("debug") == "on":
                 msg("Exception: %s" %e)
@@ -1633,7 +1651,10 @@ class PEDA(object):
             - asm code (String)
         """
         code = self.execute_redirect("x/%di 0x%x" % (count, address))
-        return code.rstrip()
+        if code:
+            return code.rstrip()
+        else:
+            return ""
 
     def dumpmem(self, start, end):
         """
@@ -2121,7 +2142,7 @@ class PEDA(object):
         return result
 
     @memoized
-    def examine_mem_reference(self, value):
+    def examine_mem_reference(self, value, depth=5):
         """
         Deeply examine a value in memory for its references
 
@@ -2132,8 +2153,16 @@ class PEDA(object):
             - list of tuple of (value(Int), type(String), next_value(Int))
         """
         result = []
+        if depth <= 0:
+            depth = 0xffffffff
+
         (v, t, vn) = self.examine_mem_value(value)
         while vn is not None:
+            if len(result) > depth:
+                _v, _t, _vn = result[-1]
+                result[-1] = (_v, _t, "--> ...")
+                break
+
             result += [(v, t, vn)]
             if v == vn or to_int(v) == to_int(vn): # point to self
                 break
@@ -2536,12 +2565,9 @@ class PEDA(object):
 
         for line in out.splitlines():
             if "GNU_RELRO" in line:
-                result["RELRO"] = 2 # Partial | NO BIND_NOW + GNU_RELRO
+                result["RELRO"] |= 2
             if "BIND_NOW" in line:
-                if result["RELRO"] == 2:
-                     result["RELRO"] = 3 # Full | BIND_NOW + GNU_RELRO
-                else:
-                     result["RELRO"] = 0 # ? | BIND_NOW + NO GNU_RELRO = NO PROTECTION
+                result["RELRO"] |= 1
             if "__stack_chk_fail" in line:
                 result["CANARY"] = 1
             if "GNU_STACK" in line and "RWE" in line:
@@ -2553,6 +2579,10 @@ class PEDA(object):
             if "_chk@" in line:
                 result["FORTIFY"] = 1
 
+        if result["RELRO"] == 1:
+            result["RELRO"] = 0 # ? | BIND_NOW + NO GNU_RELRO = NO PROTECTION
+        # result["RELRO"] == 2 # Partial | NO BIND_NOW + GNU_RELRO
+        # result["RELRO"] == 3 # Full | BIND_NOW + GNU_RELRO
         return result
 
     def _verify_rop_gadget(self, start, end, depth=5):
@@ -2649,6 +2679,10 @@ class PEDA(object):
                 search += b".{0,24}\\xc3"
             searches.append(search)
 
+        if not searches:
+            warning_msg("invalid asmcode: '%s'" % asmcode)
+            return []
+
         search = b"(?=(" + b"|".join(searches) + b"))"
         candidates = self.searchmem(start, end, search)
 
@@ -2702,7 +2736,7 @@ class PEDA(object):
 
         if len(mem) > 20000: # limit backward depth if searching in large mem
             depth = 3
-        found = re.finditer("\xc3", mem)
+        found = re.finditer(b"\xc3", mem)
         found = list(found)
         for m in found:
             idx = start+m.start()
@@ -4798,17 +4832,9 @@ class PEDACmd(object):
                 for r in REGISTERS[bits]:
                     if r in regs:
                         text += get_reg_text(r, regs[r])
-                        # text += green("%s" % r.upper().ljust(3)) + ": "
-                        # chain = peda.examine_mem_reference(regs[r])
-                        # text += format_reference_chain(chain)
-                        # text += "\n"
             else:
                 for (r, v) in sorted(regs.items()):
                     text += get_reg_text(r, v)
-                    # text += green("%s" % r.upper().ljust(3)) + ": "
-                    # chain = peda.examine_mem_reference(v)
-                    # text += format_reference_chain(chain)
-                    # text += "\n"
             if text:
                 msg(text.strip())
             if regname is None or "eflags" in regname:
@@ -4819,7 +4845,7 @@ class PEDACmd(object):
             warning_msg("not a register nor an address")
         else:
             # Address
-            chain = peda.examine_mem_reference(address)
+            chain = peda.examine_mem_reference(address, depth=0)
             text += format_reference_chain(chain) + "\n"
             vmrange = peda.get_vmrange(address)
             if vmrange:
@@ -5652,7 +5678,7 @@ class PEDACmd(object):
             MYNAME generate [arch/]platform type [port] [host]
             MYNAME search keyword (use % for any character wildcard)
             MYNAME display shellcodeId (shellcodeId as appears in search results)
-	    MYNAME zsc [generate customize shellcode] 
+	    MYNAME zsc [generate customize shellcode]
 
             For generate option:
                 default port for bindport shellcode: 16706 (0x4142)
@@ -5755,7 +5781,7 @@ class PEDACmd(object):
                         os = input('%s'%blue('os:'))
                     if pyversion is 3:
                         os = input('%s'%blue('os:'))
-                    if os in oslist: #check if os exist 
+                    if os in oslist: #check if os exist
                         break
                     else:
                         warning_msg("Wrong input! Try Again.")
